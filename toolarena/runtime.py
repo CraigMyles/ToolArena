@@ -1,12 +1,16 @@
 """This is the client that communicates with the tool runtime running inside a Docker container."""
 
+import http.client
 import itertools
+import json
 import os
 import re
 import shutil
+import socket
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Final, Iterator, Literal, Self, Sequence, cast
 
@@ -25,6 +29,43 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 from toolarena.definition import ArgumentType, Mount
 from toolarena.utils import ROOT_DIR, join_paths, rmdir
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection over Unix socket for Podman libpod API."""
+
+    def __init__(self, socket_path: str, timeout: int = 480):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+@lru_cache(maxsize=1)
+def get_container_runtime() -> Literal["docker", "podman"]:
+    """Detect if using Docker or Podman."""
+    client = docker.from_env()
+    version_info = client.version()
+    components = version_info.get("Components", [])
+    for component in components:
+        if "Podman" in component.get("Name", ""):
+            logger.info("Detected Podman container runtime")
+            return "podman"
+    logger.info("Detected Docker container runtime")
+    return "docker"
+
+
+def _get_podman_socket_path() -> str:
+    """Get the Podman socket path from DOCKER_HOST or default location."""
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host.startswith("unix://"):
+        return docker_host[7:]
+    # Default XDG_RUNTIME_DIR location
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return f"{xdg_runtime}/podman/podman.sock"
 
 TOOL_DOCKERFILE: Final[Path] = ROOT_DIR / "docker" / "tool.Dockerfile"
 DEFAULT_TOOL_IMAGE_NAME: Final[str] = "toolarena-tool"
@@ -202,9 +243,21 @@ def build_image(
     This function streams the build output to the console while the build is running.
     """
     logger.debug(f"Building image {repository}:{tag} using Docker BuildKit")
+
+    # Copy Dockerfile into context for Podman compatibility
+    # Podman's API doesn't handle absolute dockerfile paths correctly
+    context_path = Path(context)
+    dockerfile_path = Path(dockerfile)
+    dockerfile_in_context = context_path / "Dockerfile"
+    if dockerfile_path.is_absolute() and not dockerfile_in_context.exists():
+        shutil.copy(dockerfile_path, dockerfile_in_context)
+        dockerfile_arg = "Dockerfile"
+    else:
+        dockerfile_arg = str(dockerfile)
+
     resp = get_docker().api.build(
         path=str(context),
-        dockerfile=str(dockerfile),
+        dockerfile=dockerfile_arg,
         tag=f"{repository}:{tag}",
         buildargs={
             "DOCKER_BUILDKIT": "1",
@@ -258,6 +311,99 @@ class DockerRuntimeClient(HTTPToolClient):
         return int(port.split("/")[0])  # may be "1234/tcp"
 
     @classmethod
+    def _start_container_podman_gpu(
+        cls,
+        image: Image,
+        name: str,
+        port: int | None = None,
+        mounts: Mounts | None = None,
+        env: Mapping[str, str] = {},
+    ) -> Container:
+        """Start a container with GPU access using Podman's libpod API with CDI devices.
+
+        This is needed because Podman doesn't support Docker's DeviceRequest API
+        for GPU access. Instead, Podman uses CDI (Container Device Interface).
+        """
+        socket_path = _get_podman_socket_path()
+
+        # Get GPU IDs from CUDA_VISIBLE_DEVICES or default to all
+        gpus = os.getenv("CUDA_VISIBLE_DEVICES", "").split(",")
+        gpus = [gpu.strip() for gpu in gpus if gpu.strip()]
+
+        # Build CDI device specs
+        if gpus:
+            # Use specific GPUs via CDI
+            cdi_devices = [{"path": f"nvidia.com/gpu={gpu}"} for gpu in gpus]
+        else:
+            # Use all GPUs
+            cdi_devices = [{"path": "nvidia.com/gpu=all"}]
+
+        # Set CUDA_VISIBLE_DEVICES inside the container to be sequential
+        env = dict(env)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(len(gpus)))) if gpus else "0,1"
+
+        logger.debug(f"Starting Podman container with CDI devices: {cdi_devices}")
+        logger.debug(f"CUDA_VISIBLE_DEVICES inside the container: {env.get('CUDA_VISIBLE_DEVICES')}")
+
+        # Build the mounts list for libpod API
+        docker_mounts = (mounts or Mounts()).to_docker()
+        libpod_mounts = []
+        for m in docker_mounts:
+            libpod_mounts.append({
+                "destination": m["Target"],
+                "source": m["Source"],
+                "type": "bind",
+                "options": ["rbind"] + (["ro"] if m.get("ReadOnly") else []),
+            })
+
+        # Get image name (use first tag or ID)
+        image_name = image.tags[0] if image.tags else image.id
+
+        # Create container via libpod API
+        create_payload = {
+            "image": image_name,
+            "name": name,
+            "devices": cdi_devices,
+            "mounts": libpod_mounts,
+            "portmappings": [{"container_port": 8000, "host_port": port or 0}],
+            "env": env,
+            "terminal": True,
+            "resource_limits": {
+                "memory": {"limit": 100 * 1024 * 1024 * 1024},  # 100GB
+            },
+            "shm_size": 10 * 1024 * 1024 * 1024,  # 10GB
+        }
+
+        conn = _UnixHTTPConnection(socket_path)
+        conn.request(
+            "POST",
+            "/v5.0.0/libpod/containers/create",
+            body=json.dumps(create_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp_data = json.loads(resp.read().decode())
+
+        if resp.status != 201:
+            raise RuntimeError(f"Failed to create Podman container: {resp_data}")
+
+        container_id = resp_data["Id"]
+        logger.debug(f"Created Podman container {container_id[:12]}")
+
+        # Start container
+        conn = _UnixHTTPConnection(socket_path)
+        conn.request("POST", f"/v5.0.0/libpod/containers/{container_id}/start")
+        resp = conn.getresponse()
+        if resp.status not in (200, 204):
+            error = resp.read().decode()
+            raise RuntimeError(f"Failed to start Podman container: {error}")
+
+        logger.debug(f"Started Podman container {container_id[:12]}")
+
+        # Return the container object via docker-py for compatibility
+        return get_docker().containers.get(container_id)
+
+    @classmethod
     def _start_container(
         cls,
         image: Image,
@@ -267,6 +413,16 @@ class DockerRuntimeClient(HTTPToolClient):
         cuda: bool = False,
         env: Mapping[str, str] = {},
     ) -> Container:
+        # Use Podman's libpod API for GPU containers when running on Podman
+        if cuda and get_container_runtime() == "podman":
+            return cls._start_container_podman_gpu(
+                image=image,
+                name=name,
+                port=port,
+                mounts=mounts,
+                env=env,
+            )
+
         device_requests = []
         if cuda:
             gpus = os.getenv("CUDA_VISIBLE_DEVICES", "").split(",")
