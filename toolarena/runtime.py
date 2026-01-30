@@ -149,7 +149,7 @@ class HTTPToolClient:
         except httpx.HTTPError:
             return False
 
-    def wait_for_alive(self, timeout: float | None = 10.0) -> Self:
+    def wait_for_alive(self, timeout: float | None = 60.0) -> Self:
         logger.debug(f"Waiting for runtime client {self.name} to become ready")
         if timeout is None:
             timeout = float("inf")
@@ -464,7 +464,7 @@ class DockerRuntimeClient(HTTPToolClient):
         name: str,
         image: str | Image,
         port: int | None = None,
-        timeout: float | None = 10.0,  # max wait time for the runtime to become ready
+        timeout: float | None = 60.0,  # max wait time for the runtime to become ready
         mounts: Mounts | None = None,
         # Below, cuda works as follows:
         # - if True: use GPUs specified in CUDA_VISIBLE_DEVICES, or use GPU 0 if CUDA_VISIBLE_DEVICES is not set
