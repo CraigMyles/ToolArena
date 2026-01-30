@@ -12,17 +12,20 @@ def medsss_generate(user_message: str = "How to stop a cough?") -> dict:
         }
     """
 
-    # Adapted from https://github.com/pixas/MedSSS?tab=readme-ov-file#%EF%B8%8F-model
-    from peft import PeftModel
+    # Load the MedSSS_Policy model
+    # See: https://huggingface.co/pixas/MedSSS_Policy
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.1-8B-Instruct", torch_dtype="auto", device_map="auto"
+    model = AutoModelForCausalLM.from_pretrained(
+        "pixas/MedSSS_Policy",
+        torch_dtype=torch.float16,  # Use float16 for numerical stability
+        device_map="auto"
     )
-    model = PeftModel.from_pretrained(
-        base_model, "pixas/MedSSS_Policy", torc_dtype="auto", device_map="auto"
-    )
+    model.eval()  # Set to evaluation mode
     tokenizer = AutoTokenizer.from_pretrained("pixas/MedSSS_Policy")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     messages = [{"role": "user", "content": user_message}]
     inputs = tokenizer(
         tokenizer.apply_chat_template(
@@ -30,6 +33,11 @@ def medsss_generate(user_message: str = "How to stop a cough?") -> dict:
         ),
         return_tensors="pt",
     ).to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=2048)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=2048,
+            do_sample=False  # Use greedy decoding for stability
+        )
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return {"response": response}
