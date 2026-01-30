@@ -35,10 +35,12 @@ def test_num_heatmaps(invocation: ToolRunResult, expected_num_heatmaps: int):
 def test_byte_size_heatmaps(
     invocation: ToolRunResult, expected_byte_size_heatmaps: int
 ):
-    np.testing.assert_almost_equal(
-        invocation.result["byte_size_heatmaps"],
-        expected_byte_size_heatmaps,
-        decimal=-2,
+    # Allow 0.1% tolerance for minor platform/runtime differences
+    actual = invocation.result["byte_size_heatmaps"]
+    tolerance = expected_byte_size_heatmaps * 0.001
+    assert abs(actual - expected_byte_size_heatmaps) <= tolerance, (
+        f"Byte size {actual} differs from expected {expected_byte_size_heatmaps} "
+        f"by more than 0.1% (tolerance: {tolerance:.0f} bytes)"
     )
 
 

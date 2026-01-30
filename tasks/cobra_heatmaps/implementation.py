@@ -24,6 +24,13 @@ def cobra_heatmaps(
     import yaml
     import h5py
 
+    # Set environment variables to help Triton find CUDA and disable problematic features
+    os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
+    # Disable autotuning to avoid the compilation bug
+    os.environ["TRITON_DISABLE_AUTOTUNING"] = "1"
+    os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_cache"
+
     """ unsupervised heatmap generation using COBRA """
     
     # Create the output directory if it doesn't exist
